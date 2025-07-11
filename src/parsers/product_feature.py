@@ -1,4 +1,3 @@
-import asyncio
 import re
 from typing import List, Optional
 from bs4 import BeautifulSoup
@@ -45,7 +44,7 @@ class ProductFeatureParser:
             category=category,
             attributes=attributes,
             suppliers=suppliers
-        ).model_dump()
+        )
 
     def _extract_title(self, soup: BeautifulSoup) -> str:
         """Извлекает название товара"""
@@ -54,35 +53,58 @@ class ProductFeatureParser:
         if meta_title and meta_title.get('content'):
             return meta_title.get('content')
 
-        # Альтернативный поиск в title или h1
-        title_tag = soup.find('h1') or soup.find('title')
+        # Альтернативный поиск в h1
+        h1_tag = soup.find('h1')
+        if h1_tag:
+            return h1_tag.get_text(strip=True)
+
+        # Поиск в title
+        title_tag = soup.find('title')
         if title_tag:
             return title_tag.get_text(strip=True)
 
-        return 'Название не найдено'
+        return 'Нет данных'
 
     def _extract_description(self, soup: BeautifulSoup) -> str:
         """Извлекает описание товара"""
-        # Ищем в блоке описания
+        # Ищем в табе описания (может быть активным или неактивным)
+        descr_tab = soup.find('div', {'id': 'descr'})
+        if descr_tab:
+            # Ищем в descr-outer-wrapper
+            descr_wrapper = descr_tab.find('div', class_='descr-outer-wrapper')
+            if descr_wrapper:
+                text = descr_wrapper.get_text(strip=True)
+                if text:
+                    return text
+
+            # Ищем любой текст в табе описания
+            text = descr_tab.get_text(strip=True)
+            # Убираем заголовок "Описание"
+            text = text.replace('Описание', '').strip()
+            if text:
+                return text
+
+        # Ищем в основном блоке описания (если есть)
         desc_block = soup.find('div', class_='detail_text')
         if desc_block:
-            return desc_block.get_text(strip=True)
+            text = desc_block.get_text(strip=True)
+            if text:
+                return text
 
         # Альтернативный поиск в meta описании
         meta_desc = soup.find('meta', {'itemprop': 'description'})
         if meta_desc and meta_desc.get('content'):
-            return meta_desc.get('content')
+            content = meta_desc.get('content')
+            # Проверяем, что описание не дублирует название
+            title = self._extract_title(soup)
+            if content and content != title:
+                return content
 
-        return 'Описание отсутствует'
+        return 'Нет данных'
 
     def _extract_article(self, soup: BeautifulSoup) -> str:
         """Извлекает артикул товара"""
-        # Ищем в meta теге sku
-        meta_sku = soup.find('meta', {'itemprop': 'sku'})
-        if meta_sku and meta_sku.get('content'):
-            return meta_sku.get('content')
-
-        # Ищем в таблице характеристик
+        # Сначала ищем в таблице характеристик (приоритет)
         props_table = soup.find('table', class_='props_list')
         if props_table:
             rows = props_table.find_all('tr')
@@ -91,10 +113,28 @@ class ProductFeatureParser:
                 value_cell = row.find('td', class_='char_value')
                 if name_cell and value_cell:
                     name = name_cell.get_text(strip=True)
-                    if name in ['Артикул', 'ШтрихКод']:
+                    if name == 'Артикул':
+                        article = value_cell.get_text(strip=True)
+                        if article:
+                            return article
+
+        # Если не найден в таблице, ищем в meta теге sku
+        meta_sku = soup.find('meta', {'itemprop': 'sku'})
+        if meta_sku and meta_sku.get('content'):
+            return meta_sku.get('content')
+
+        # Ищем ШтрихКод как альтернативу
+        if props_table:
+            rows = props_table.find_all('tr')
+            for row in rows:
+                name_cell = row.find('td', class_='char_name')
+                value_cell = row.find('td', class_='char_value')
+                if name_cell and value_cell:
+                    name = name_cell.get_text(strip=True)
+                    if name == 'ШтрихКод':
                         return value_cell.get_text(strip=True)
 
-        return 'Артикул не найден'
+        return 'Нет данных'
 
     def _extract_brand(self, soup: BeautifulSoup) -> str:
         """Извлекает бренд товара"""
@@ -114,7 +154,7 @@ class ProductFeatureParser:
                             return brand_link.get_text(strip=True)
                         return value_cell.get_text(strip=True)
 
-        return 'Бренд не указан'
+        return 'Нет данных'
 
     def _extract_country(self, soup: BeautifulSoup) -> str:
         """Извлекает страну производителя"""
@@ -170,33 +210,66 @@ class ProductFeatureParser:
     def _extract_attributes(self, soup: BeautifulSoup) -> List[Attribute]:
         """Извлекает атрибуты товара без дублирования"""
         attributes = []
-        seen_attributes = set()  # Для отслеживания уже добавленных характеристик
+        seen_attributes = set()
 
-        # Характеристики, которые уже извлекаются как отдельные поля и не должны дублироваться
+        # Характеристики, которые уже извлекаются как отдельные поля
         excluded_attributes = {
             'бренд', 'артикул', 'штрихкод', 'производитель', 'категория товара',
             'код', 'название', 'описание', 'цена', 'стоимость'
         }
 
-        # Основная таблица характеристик
-        props_table = soup.find('table', class_='props_list')
-        if props_table:
+        # Ищем таблицы характеристик: в основном блоке и в табе #props
+        tables_to_check = []
+
+        # 1. Основная таблица в верхней части товара
+        main_char_blocks = soup.find_all('div', class_='char_block')
+        for block in main_char_blocks:
+            table = block.find('table', class_='props_list')
+            if table:
+                tables_to_check.append(table)
+
+        # 2. Таблица в табе #props (может быть неактивным)
+        props_tab = soup.find('div', {'id': 'props'})
+        if props_tab:
+            char_block = props_tab.find('div', class_='char_block')
+            if char_block:
+                tab_table = char_block.find('table', class_='props_list')
+                if tab_table and tab_table not in tables_to_check:
+                    tables_to_check.append(tab_table)
+
+        # Обрабатываем все найденные таблицы
+        for props_table in tables_to_check:
             rows = props_table.find_all('tr')
             for row in rows:
                 name_cell = row.find('td', class_='char_name')
                 value_cell = row.find('td', class_='char_value')
-                if name_cell and value_cell:
-                    name = name_cell.get_text(strip=True)
 
-                    # Извлекаем текст, игнорируя ссылки
-                    value_link = value_cell.find('a')
-                    if value_link:
-                        value = value_link.get_text(strip=True)
+                if name_cell and value_cell:
+                    # Извлекаем название из span с itemprop="name"
+                    name_span = name_cell.find('span', {'itemprop': 'name'})
+                    if name_span:
+                        name = name_span.get_text(strip=True)
                     else:
-                        value = value_cell.get_text(strip=True)
+                        name = name_cell.get_text(strip=True)
+
+                    # Извлекаем значение из span с itemprop="value" или любого содержимого
+                    value_span = value_cell.find('span', {'itemprop': 'value'})
+                    if value_span:
+                        # Проверяем есть ли ссылка внутри
+                        value_link = value_span.find('a')
+                        if value_link:
+                            value = value_link.get_text(strip=True)
+                        else:
+                            value = value_span.get_text(strip=True)
+                    else:
+                        # Если нет span с itemprop, берем весь текст ячейки
+                        value_link = value_cell.find('a')
+                        if value_link:
+                            value = value_link.get_text(strip=True)
+                        else:
+                            value = value_cell.get_text(strip=True)
 
                     if name and value:
-                        # Приводим название к нижнему регистру для проверки
                         name_lower = name.lower().strip()
 
                         # Пропускаем исключенные характеристики
@@ -207,7 +280,6 @@ class ProductFeatureParser:
                         if name_lower in seen_attributes:
                             continue
 
-                        # Добавляем характеристику
                         attributes.append(Attribute(attr_name=name, attr_value=value))
                         seen_attributes.add(name_lower)
 
@@ -215,9 +287,18 @@ class ProductFeatureParser:
 
     def _extract_price(self, soup: BeautifulSoup) -> float:
         """Извлекает цену товара"""
-        # Ищем цену в блоке цен
+        # Ищем цену в блоке цен с атрибутом data-value
         price_block = soup.find('div', class_='price')
         if price_block:
+            # Сначала пробуем data-value атрибут
+            data_value = price_block.get('data-value')
+            if data_value:
+                try:
+                    return float(data_value)
+                except ValueError:
+                    pass
+
+            # Если нет data-value, ищем в span с классом price_value
             price_value = price_block.find('span', class_='price_value')
             if price_value:
                 price_text = price_value.get_text(strip=True)
@@ -238,9 +319,15 @@ class ProductFeatureParser:
 
     def _extract_stock(self, soup: BeautifulSoup) -> str:
         """Извлекает информацию о наличии"""
+        # Ищем в div с классом item-stock
         stock_block = soup.find('div', class_='item-stock')
         if stock_block:
             return stock_block.get_text(strip=True)
+
+        # Альтернативный поиск
+        stock_blocks = soup.find_all('div', string=re.compile(r'В наличии|Нет в наличии|Под заказ'))
+        if stock_blocks:
+            return stock_blocks[0].get_text(strip=True)
 
         return 'Нет данных'
 

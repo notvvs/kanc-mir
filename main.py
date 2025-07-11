@@ -1,7 +1,35 @@
 import asyncio
+import logging
 
-from src.scrapers.scraper import PageScraper
+from src.services.parser_service import ParserService
 
-test = PageScraper()
 
-print(asyncio.run(test.scrape_page('https://kanc-mir.ru/catalog/salfetki_vlazhnye_detskie/331482/#props')))
+def setup_logging():
+    """Настройка логирования"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
+
+
+async def main():
+    """Главная функция для запуска парсинга"""
+    setup_logging()
+
+    parser_service = ParserService()
+
+    # Запуск парсинга всех категорий
+    await parser_service.start_parsing('https://kanc-mir.ru/catalog/')
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Парсинг прерван пользователем")
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        logging.error(f"Критическая ошибка в main: {e}")
